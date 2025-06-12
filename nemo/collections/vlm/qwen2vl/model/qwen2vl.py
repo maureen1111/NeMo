@@ -12,723 +12,1061 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Tuple, Union
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple
 
+import lightning.pytorch as L
 import torch
-import transformers
+import torch.distributed
+from megatron.core import dist_checkpointing
+from megatron.core import parallel_state as ps
+from megatron.core.enums import ModelType
+from megatron.core.inference_params import InferenceParams
+from megatron.core.models.multimodal.llava_model import LLaVAModel as MCoreLLaVAModel
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from transformers import Qwen2VLConfig as HFQwen2VLConfig
-from transformers import Qwen2VLForConditionalGeneration
-from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig as HFQwen2VLVisionConfig
+from megatron.core.utils import get_batch_on_this_cp_rank
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core import tensor_parallel
+from torch import nn
 
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
-from nemo.collections.llm import Qwen2Config, Qwen2Config1P5B, Qwen2Config7B, Qwen2Config72B
-from nemo.collections.vlm.neva.model.llava import export_qkv, export_qkv_bias
-from nemo.collections.vlm.qwen2vl.model.base import Qwen2VLConfig, Qwen2VLModel, Qwen2VLVisionConfig
+from nemo.collections.llm import fn
+from nemo.collections.llm.fn.activation import quick_gelu
+from nemo.collections.llm.gpt.model.qwen2 import Qwen2Config
+from nemo.collections.vlm.layer_specs import get_layer_spec_te
+from nemo.collections.vlm.neva.model.base import MODEL_CONFIG_ATTR, restore_model_weights
+from nemo.collections.vlm.qwen2vl.data.multimodal_tokens import IGNORE_INDEX, IMAGE_TOKEN_INDEX, VIDEO_TOKEN_INDEX
+from nemo.collections.vlm.qwen2vl.model.vision import Qwen2VisionModel
 from nemo.collections.vlm.vision import MultimodalProjectorConfig
-from nemo.export.trt_llm.nemo_ckpt_loader.nemo_file import load_distributed_model_weights
-from nemo.lightning import io, teardown
-from nemo.lightning.io.state import _ModelState
-from nemo.lightning.pytorch.utils import dtype_from_hf
+from nemo.collections.vlm.vision.base import get_image_sequence_length
+from nemo.lightning import io
+from nemo.lightning.megatron_parallel import MaskedTokenLossReductionWithLossMask
+from nemo.lightning.pytorch.optim import MegatronOptimizerModule, OptimizerModule
 from nemo.utils import logging
 
-if TYPE_CHECKING:
-    from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+
+def qwen2vl_data_step(dataloader_iter) -> Dict[str, torch.Tensor]:
+    """Qwen2VL Data Step"""
+    from megatron.core import parallel_state
+
+    # Based on: https://github.com/NVIDIA/Megatron-LM/blob/main/pretrain_gpt.py#L87
+    # https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/nlp/models/language_modeling/megatron_gpt_model.py#L828-L842
+    batch = next(dataloader_iter)
+    _batch: dict
+    if isinstance(batch, tuple) and len(batch) == 3:
+        _batch = batch[0]
+    else:
+        _batch = batch
+
+    required_keys = set()
+    required_keys.update(("input_ids", "pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"))
+    if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        required_keys.update(("position_ids",))
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        required_keys.update(
+            (
+                "labels",
+                "loss_mask",
+            )
+        )
+
+    packed_seq_params = _batch.get("packed_seq_params", None)
+    _batch = {
+        key: val.cuda(non_blocking=True) if key in required_keys and val is not None else None
+        for key, val in _batch.items()
+    }
+    if packed_seq_params is not None:
+        for attr in ["cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded"]:
+            value = getattr(packed_seq_params, attr, None)
+            if value is not None:
+                setattr(packed_seq_params, attr, value.cuda(non_blocking=True))
+    _batch["packed_seq_params"] = packed_seq_params
+    # slice batch along sequence dimension for context parallelism
+    output = get_batch_on_this_cp_rank(_batch)
+
+    return output
 
 
-# Note: these Qwen2VL configs are copied from the corresponding HF model. You may need to modify the parameter for
-# your own needs
+def qwen2vl_forward_step(model, batch) -> torch.Tensor:
+    # pylint: disable=C0115,C0116
+    forward_args = {
+        "input_ids": batch["input_ids"],
+        "pixel_values": batch.get("pixel_values", None),
+        "image_grid_thw": batch.get("image_grid_thw", None),
+        "pixel_values_videos": batch.get("pixel_values_videos", None),
+        "video_grid_thw": batch.get("video_grid_thw", None),
+        "loss_mask": batch.get("loss_mask", None),
+        "labels": batch.get("labels", None),
+        "packed_seq_params": batch.get("packed_seq_params", None),
+    }
+
+    return model(**forward_args)
+
+
+def set_input_tensor(self, tensor):
+    # pylint: disable=C0115,C0116
+    pass
+
+
 @dataclass
-class Qwen2VLConfig2B(Qwen2VLConfig):
-    """Qwen2VL Config 2B"""
+class Qwen2VLVisionConfig(TransformerConfig, io.IOMixin):
+    """Qwen2VL Vision Model Config"""
 
-    from transformers import PretrainedConfig
+    add_class_token: bool = False
+    class_token_len: int = 1
+    patch_dim: int = 14
+    img_h: int = 336
+    img_w: int = 336
+    num_layers: int = 32
+    num_attention_heads: int = 16
+    add_bias_linear: bool = True
+    add_qkv_bias: bool = True
+    embed_dim: int = 1280
+    hidden_size: int = 1280
+    spatial_merge_size: int = 2
+    spatial_patch_size: int = 14
+    temporal_patch_size: int = 2
+    hidden_dropout: float = 0.0
+    attention_dropout: float = 0.0
+    ffn_hidden_size: int = 5120  # 1280 * 4
+    gated_linear_unit: bool = False
+    activation_func: Callable = quick_gelu
+    kv_channels: int = 80
+    num_query_groups: int = 16
+    layernorm_zero_centered_gamma: bool = False
+    apply_query_key_layer_scaling: bool = False
+    bias_activation_fusion: bool = False
+    bias_dropout_fusion: bool = False
+    attention_softmax_in_fp32: bool = True
+    normalization: str = 'LayerNorm'
+    apply_rope_fusion: bool = False
+    layernorm_epsilon: float = 1e-6
+    transformer_layer_spec: ModuleSpec = None
 
-    language_transformer_config: TransformerConfig = field(
-        default_factory=lambda: Qwen2Config1P5B(share_embeddings_and_output_weights=True)
-    )
-    vision_transformer_config: Union[TransformerConfig, PretrainedConfig] = field(
-        default_factory=lambda: Qwen2VLVisionConfig(num_layers=32, num_attention_heads=16)
-    )
-    vision_projection_config: TransformerConfig = field(
-        default_factory=lambda: MultimodalProjectorConfig(input_size=5120, hidden_size=1536, ffn_hidden_size=5120)
-    )
+    def configure_model(self) -> "Qwen2VisionModel":
+        # pylint: disable=C0115,C0116
+        transformer_layer_spec = self.transformer_layer_spec
+        if not isinstance(transformer_layer_spec, ModuleSpec):
+            transformer_layer_spec = get_layer_spec_te(is_vit=True)
+
+        model = Qwen2VisionModel(
+            self,
+            transformer_layer_spec,
+            add_class_token=self.add_class_token,
+            class_token_len=self.class_token_len,
+            patch_dim=self.patch_dim,
+            temporal_patch_size=self.temporal_patch_size,
+            spatial_merge_size=self.spatial_merge_size,
+            spatial_patch_size=self.spatial_patch_size,
+            img_h=self.img_h,
+            img_w=self.img_w,
+        )
+
+        return model
 
 
 @dataclass
-class Qwen2VLConfig7B(Qwen2VLConfig):
-    """Qwen2VL Config 7B"""
+class Qwen2VLConfig(TransformerConfig, io.IOMixin):
+    """Qwen2VL Model Base Config"""
 
-    from transformers import PretrainedConfig
+    language_transformer_config: Optional[Qwen2Config] = None
+    vision_transformer_config: Optional[Qwen2VLVisionConfig] = None
+    vision_projection_config: Optional[MultimodalProjectorConfig] = None
 
-    language_transformer_config: TransformerConfig = field(default_factory=lambda: Qwen2Config7B())
-    vision_transformer_config: Union[TransformerConfig, PretrainedConfig] = field(
-        default_factory=lambda: Qwen2VLVisionConfig(num_layers=32, num_attention_heads=16)
-    )
-    vision_projection_config: TransformerConfig = field(
-        default_factory=lambda: MultimodalProjectorConfig(input_size=5120, hidden_size=3584, ffn_hidden_size=5120)
-    )
+    drop_vision_class_token: bool = False
+    vision_feature_layer: int = -2
 
+    encoder_pipeline_model_parallel_size: int = 0
+    encoder_tensor_model_parallel_size: int = 1
+    num_layers: int = 1  # Placeholder, NOT used!
+    num_attention_heads: int = 8  # Placeholder, NOT used!
 
-@dataclass
-class Qwen2VLConfig72B(Qwen2VLConfig):
-    """Qwen2VL Config 72B"""
+    seq_length: int = 1024
 
-    from transformers import PretrainedConfig
+    language_model_from_pretrained: Optional[str] = None
+    vision_model_from_pretrained: Optional[str] = None  # TODO
+    vision_projection_from_pretrained: Optional[str] = None  # TODO
 
-    language_transformer_config: TransformerConfig = field(default_factory=lambda: Qwen2Config72B())
-    vision_transformer_config: Union[TransformerConfig, PretrainedConfig] = field(
-        default_factory=lambda: Qwen2VLVisionConfig(num_layers=32, num_attention_heads=16)
-    )
-    vision_projection_config: TransformerConfig = field(
-        default_factory=lambda: MultimodalProjectorConfig(input_size=5120, hidden_size=8192, ffn_hidden_size=5120)
-    )
+    freeze_language_model: bool = False
+    freeze_vision_model: bool = False
+    freeze_vision_projection: bool = False
 
+    forward_step_fn: Callable = qwen2vl_forward_step
+    data_step_fn: Callable = qwen2vl_data_step
 
-@io.model_importer(Qwen2VLModel, "hf")
-class HFQwen2VLImporter(io.ModelConnector["Qwen2VLForConditionalGeneration", Qwen2VLModel]):
-    """Qwen2VL Model HF Importer"""
-
-    def init(self) -> Qwen2VLModel:
+    def __post_init__(self):
         # pylint: disable=C0115,C0116
-        return Qwen2VLModel(self.config, tokenizer=self.tokenizer)
+        if self.language_transformer_config is not None:
+            for attr in MODEL_CONFIG_ATTR:
+                setattr(self, attr, getattr(self.language_transformer_config, attr))
+            # must have this setting to use MultimodalRotaryEmbedding in GPTModel
+            self.language_transformer_config.position_embedding_type = "mrope"
+            # See Qwen2-VL 2B/7B/72B share the same mrope_section config, see below for details:
+            # https://huggingface.co/Qwen/Qwen2-VL-72B-Instruct/blob/main/config.json
+            # https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/blob/main/config.json
+            # https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct/blob/main/config.json
+            self.language_transformer_config.mrope_section = [16, 24, 24]
 
-    def apply(self, output_path: Path) -> Path:
+    def configure_model(self, tokenizer) -> "MCoreQwen2VLModel":
         # pylint: disable=C0115,C0116
+        self.language_transformer_config.scatter_embedding_sequence_parallel = False
+        self.language_transformer_config.tensor_model_parallel_size = self.tensor_model_parallel_size
+        self.language_transformer_config.sequence_parallel = self.sequence_parallel
+        self.vision_transformer_config.tensor_model_parallel_size = self.tensor_model_parallel_size
+        self.vision_projection_config.tensor_model_parallel_size = self.tensor_model_parallel_size
+        self.language_transformer_config.pipeline_model_parallel_size = self.pipeline_model_parallel_size
 
-        source = Qwen2VLForConditionalGeneration.from_pretrained(str(self))
-        target = self.init()
-        trainer = self.nemo_setup(target)
-        source = source.to(dtype_from_hf(source.config))
-        target = target.to(dtype_from_hf(source.config))
-        self.convert_state(source, target)
-        print(f"Converted Qwen2VL model to Nemo, saving to {output_path}")
-        # for name, param in target.named_parameters():
-        #     print(name, param.shape)
-        self.nemo_save(output_path, trainer)
-
-        print(f"Converted Qwen2VL model saved to {output_path}")
-
-        teardown(trainer, target)
-        del trainer, target
-
-        return output_path
-
-    def convert_state(self, source, target):
-        # pylint: disable=C0115,C0116,C0301
-        mapping = {
-            "visual.patch_embed.proj.weight": "vision_model.conv1.weight",
-            "visual.blocks.*.norm1.weight": "vision_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
-            "visual.blocks.*.norm1.bias": "vision_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_bias",
-            "visual.blocks.*.norm2.weight": "vision_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
-            "visual.blocks.*.norm2.bias": "vision_model.decoder.layers.*.mlp.linear_fc1.layer_norm_bias",
-            "visual.blocks.*.attn.proj.weight": "vision_model.decoder.layers.*.self_attention.linear_proj.weight",
-            "visual.blocks.*.attn.proj.bias": "vision_model.decoder.layers.*.self_attention.linear_proj.bias",
-            "visual.blocks.*.mlp.fc1.weight": "vision_model.decoder.layers.*.mlp.linear_fc1.weight",
-            "visual.blocks.*.mlp.fc1.bias": "vision_model.decoder.layers.*.mlp.linear_fc1.bias",
-            "visual.blocks.*.mlp.fc2.weight": "vision_model.decoder.layers.*.mlp.linear_fc2.weight",
-            "visual.blocks.*.mlp.fc2.bias": "vision_model.decoder.layers.*.mlp.linear_fc2.bias",
-            "visual.merger.ln_q.weight": "vision_model.decoder.final_layernorm.weight",
-            "visual.merger.ln_q.bias": "vision_model.decoder.final_layernorm.bias",
-            "model.embed_tokens.weight": "language_model.embedding.word_embeddings.weight",
-            "model.layers.*.self_attn.o_proj.weight": "language_model.decoder.layers.*.self_attention.linear_proj.weight",
-            "model.layers.*.mlp.down_proj.weight": "language_model.decoder.layers.*.mlp.linear_fc2.weight",
-            "model.layers.*.input_layernorm.weight": "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight",
-            "model.layers.*.post_attention_layernorm.weight": "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight",
-            "model.norm.weight": "language_model.decoder.final_layernorm.weight",
-            # "lm_head.weight": "language_model.output_layer.weight",
-        }
-        if not target.config.language_transformer_config.share_embeddings_and_output_weights:
-            mapping.update({"lm_head.weight": "language_model.output_layer.weight"})
-
-        if "vision_projection.encoder.linear_fc1.weight" in target.module.state_dict().keys():
-            mapping.update(
-                {
-                    "visual.merger.mlp.0.weight": "vision_projection.encoder.linear_fc1.weight",
-                    "visual.merger.mlp.0.bias": "vision_projection.encoder.linear_fc1.bias",
-                    "visual.merger.mlp.2.weight": "vision_projection.encoder.linear_fc2.weight",
-                    "visual.merger.mlp.2.bias": "vision_projection.encoder.linear_fc2.bias",
-                }
+        if self.encoder_pipeline_model_parallel_size > 0:
+            assert self.encoder_pipeline_model_parallel_size == 1, "ViT can only live on 1 pipeline stage."
+            self.vision_transformer_config.pipeline_model_parallel_size = self.encoder_pipeline_model_parallel_size
+            self.vision_projection_config.pipeline_model_parallel_size = self.encoder_pipeline_model_parallel_size
+            self.language_transformer_config.encoder_pipeline_model_parallel_size = (
+                self.encoder_pipeline_model_parallel_size
             )
-        elif "vision_projection.0.weight" in target.module.state_dict().keys():
-            mapping.update(
-                {
-                    "visual.merger.mlp.0.weight": "vision_projection.0.weight",
-                    "visual.merger.mlp.0.bias": "vision_projection.0.bias",
-                    "visual.merger.mlp.2.weight": "vision_projection.2.weight",
-                    "visual.merger.mlp.2.bias": "vision_projection.2.bias",
-                }
+            if self.encoder_tensor_model_parallel_size > 0:
+                self.vision_transformer_config.tensor_model_parallel_size = self.encoder_tensor_model_parallel_size
+                self.vision_projection_config.tensor_model_parallel_size = self.encoder_tensor_model_parallel_size
+
+        model = MCoreQwen2VLModel(
+            config=self,
+            tokenizer=tokenizer,
+            pre_process=ps.is_pipeline_first_stage(ignore_virtual=False)
+            or ps.get_pipeline_model_parallel_rank() == self.encoder_pipeline_model_parallel_size,
+            post_process=ps.is_pipeline_last_stage(ignore_virtual=False),
+            add_encoder=ps.is_pipeline_first_stage(ignore_virtual=False),
+            add_decoder=ps.is_pipeline_last_stage(ignore_virtual=False)
+            or ps.get_pipeline_model_parallel_rank() >= self.encoder_pipeline_model_parallel_size,
+            drop_vision_class_token=self.drop_vision_class_token,
+        )
+
+        return model
+
+
+class MCoreQwen2VLModel(MCoreLLaVAModel):
+    """Qwen2VL Model Base Model Class"""
+
+    def __init__(
+        self,
+        config: Qwen2VLConfig,
+        tokenizer: Optional = None,
+        pre_process: bool = True,
+        post_process: bool = True,
+        add_encoder: bool = True,
+        add_decoder: bool = True,
+        drop_vision_class_token: bool = False,
+    ) -> None:
+        # pylint: disable=C0115,C0116
+        super(MCoreLLaVAModel, self).__init__(config=config)
+
+        language_transformer_config = config.language_transformer_config
+        vision_transformer_config = config.vision_transformer_config
+        vision_projection_config = config.vision_projection_config
+
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.add_encoder = add_encoder
+        self.add_decoder = add_decoder
+
+        self.encoder_hidden_state = None
+        self.vision_model = None
+        self.vision_projection = None
+        self.language_model = None
+
+        self.sequence_parallel_lm = language_transformer_config.sequence_parallel
+        self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
+        self.context_parallel_lm = language_transformer_config.context_parallel_size
+        self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
+        self.share_embeddings_and_output_weights = False
+
+        if self.add_decoder:
+            language_transformer_config.scatter_embedding_sequence_parallel = False            
+            self.language_model = language_transformer_config.configure_model(
+                tokenizer=tokenizer,
+                pre_process=pre_process,
+                post_process=post_process,
             )
+
+            self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
+            self._language_max_sequence_length = self.language_model.max_sequence_length
+            self._language_is_pipeline_parallel = language_transformer_config.pipeline_model_parallel_size > 1
+            restore_model_weights(self.language_model, config.language_model_from_pretrained)
+            logging.info(f"Restored language model weights from {config.language_model_from_pretrained}")
         else:
-            raise KeyError("Unable to map vision projection keys.")
+            if config.language_model_from_pretrained is not None:
+                dist_checkpointing.load(
+                    sharded_state_dict=dict(state_dict={}),
+                    checkpoint_dir=config.language_model_from_pretrained,
+                    validate_access_integrity=False,
+                )
 
-        return io.apply_transforms(
-            source,
-            target,
-            mapping=mapping,
-            transforms=[
-                _import_language_qkv,
-                _import_language_qkv_bias,
-                _import_vision_qkv,
-                _import_vision_qkv_bias,
-                _import_linear_fc1,
-            ],
+        if self.add_encoder:
+            self.vision_model = vision_transformer_config.configure_model()
+            self.vision_projection = vision_projection_config.configure_model()
+            self._drop_vision_class_token = drop_vision_class_token
+            restore_model_weights(self.vision_model, config.vision_model_from_pretrained)
+            logging.info(f"Restored vision model weights from {config.vision_model_from_pretrained}")
+
+        self.freeze(
+            freeze_language_model=config.freeze_language_model,
+            freeze_vision_model=config.freeze_vision_model,
+            freeze_vision_projection=config.freeze_vision_projection,
         )
 
-    @property
-    def tokenizer(self) -> "AutoTokenizer":
-        # pylint: disable=C0115,C0116
-        from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
+        self.model_type = ModelType.encoder_or_decoder
+        # This attribute is needed to check if an all-reduce is required
+        # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
 
-        return AutoTokenizer(str(self))
+        self._img_seq_len = get_image_sequence_length(
+            img_h=vision_transformer_config.img_h,
+            img_w=vision_transformer_config.img_w,
+            patch_dim=vision_transformer_config.patch_dim,
+            add_class_token=not drop_vision_class_token,
+            class_token_len=vision_transformer_config.class_token_len,
+        )
 
-    @property
-    def config(self) -> Qwen2VLConfig:
-        # pylint: disable=C0115,C0116
-        from packaging.version import Version
+    def get_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
 
-        if Version(transformers.__version__) > Version('4.51.3'):
-            # Todo: need to fix with newest version of transformers
-            raise ValueError(
-                f"Current version of transformers is {transformers.__version__},"
-                f"Please lower the version to be <= 4.51.3"
+        Explanation:
+            Each embedding sequence contains vision embedding and text embedding or just contains text embedding.
+
+            For pure text embedding sequence, the rotary position embedding has no difference with mordern LLMs.
+            Examples:
+                input_ids: [T T T T T], here T is for text.
+                temporal position_ids: [0, 1, 2, 3, 4]
+                height position_ids: [0, 1, 2, 3, 4]
+                width position_ids: [0, 1, 2, 3, 4]
+
+            For vision and text embedding sequence, we calculate 3D rotary position embedding for vision part
+            and 1D rotary position embeddin for text part.
+            Examples:
+                Assume we have a video input with 3 temporal patches, 2 height patches and 2 width patches.
+                input_ids: [V V V V V V V V V V V V T T T T T], here V is for vision.
+                vision temporal position_ids: [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
+                vision height position_ids: [0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]
+                vision width position_ids: [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+                text temporal position_ids: [3, 4, 5, 6, 7]
+                text height position_ids: [3, 4, 5, 6, 7]
+                text width position_ids: [3, 4, 5, 6, 7]
+                Here we calculate the text start position_ids as the max vision position_ids plus 1.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should
+                you provide it.
+            image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
+                The temporal, height and width of feature shape of each image in LLM.
+            video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
+                The temporal, height and width of feature shape of each video in LLM.
+            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+                - 1 for tokens that are **not masked**,
+                - 0 for tokens that are **masked**.
+
+        Returns:
+            position_ids (`torch.LongTensor` of shape `(3, batch_size, sequence_length)`)
+            mrope_position_deltas (`torch.Tensor` of shape `(batch_size)`)
+        """
+        spatial_merge_size = 2  # self.config.vision_config.spatial_merge_size
+        image_token_id = IMAGE_TOKEN_INDEX
+        video_token_id = VIDEO_TOKEN_INDEX
+        vision_start_token_id = 151652  # self.config.vision_start_token_id
+
+        mrope_position_deltas = []
+        if image_grid_thw is not None or video_grid_thw is not None:
+            total_input_ids = input_ids.clone()
+            if attention_mask is None:
+                attention_mask = torch.ones_like(total_input_ids)
+            position_ids = torch.ones(
+                3, input_ids.shape[0], input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device
             )
+            image_index, video_index = 0, 0
+            for i, input_ids_item in enumerate(total_input_ids):
+                _input_ids = input_ids_item[attention_mask[i] == 1]
+                vision_start_indices = torch.argwhere(_input_ids == vision_start_token_id).squeeze(1)
+                vision_tokens = _input_ids[vision_start_indices + 1]
+                image_nums = (vision_tokens == image_token_id).sum()
+                video_nums = (vision_tokens == video_token_id).sum()
+                input_tokens = _input_ids.tolist()
+                llm_pos_ids_list: list = []
+                st = 0
+                remain_images, remain_videos = image_nums, video_nums
+                for _ in range(image_nums + video_nums):
+                    if image_token_id in input_tokens and remain_images > 0:
+                        ed_image = input_tokens.index(image_token_id, st)
+                    else:
+                        ed_image = len(input_tokens) + 1
+                    if video_token_id in input_tokens and remain_videos > 0:
+                        ed_video = input_tokens.index(video_token_id, st)
+                    else:
+                        ed_video = len(input_tokens) + 1
+                    if ed_image < ed_video:
+                        t, h, w = (
+                            image_grid_thw[image_index][0],
+                            image_grid_thw[image_index][1],
+                            image_grid_thw[image_index][2],
+                        )
+                        image_index += 1
+                        remain_images -= 1
+                        ed = ed_image
+                    else:
+                        t, h, w = (
+                            video_grid_thw[video_index][0],
+                            video_grid_thw[video_index][1],
+                            video_grid_thw[video_index][2],
+                        )
+                        video_index += 1
+                        remain_videos -= 1
+                        ed = ed_video
+                    llm_grid_t, llm_grid_h, llm_grid_w = (
+                        t.item(),
+                        h.item() // spatial_merge_size,
+                        w.item() // spatial_merge_size,
+                    )
+                    text_len = ed - st
 
-        from transformers import Qwen2VLConfig as HFQwen2VLConfig
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
-        hf_config = HFQwen2VLConfig.from_pretrained(str(self))
+                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
 
-        def make_vocab_size_divisible_by(vocab_size):
-            # pylint: disable=C0115,C0116
-            base = 128
-            while vocab_size % base != 0:
-                base //= 2
-            return base
+                if st < len(input_tokens):
+                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                    text_len = len(input_tokens) - st
+                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
-        text_config = hf_config
-        language_transformer_config = Qwen2Config(
-            num_layers=text_config.num_hidden_layers,
-            hidden_size=text_config.hidden_size,
-            ffn_hidden_size=text_config.intermediate_size,
-            num_attention_heads=text_config.num_attention_heads,
-            init_method_std=text_config.initializer_range,
-            layernorm_epsilon=text_config.rms_norm_eps,
-            num_query_groups=text_config.num_key_value_heads,
-            rotary_base=text_config.rope_theta,
-            gated_linear_unit=True,
-            make_vocab_size_divisible_by=make_vocab_size_divisible_by(text_config.vocab_size),
-            share_embeddings_and_output_weights=text_config.tie_word_embeddings,
-            vocab_size=text_config.vocab_size,
-            fp16=(dtype_from_hf(text_config) == torch.float16),
-            bf16=(dtype_from_hf(text_config) == torch.bfloat16),
-            params_dtype=dtype_from_hf(text_config),
-        )
-
-        # Use MCore instead of Pytorch
-        vision_config = hf_config.vision_config
-
-        # Use MCore instead of Pytorch
-        vision_transformer_config = Qwen2VLVisionConfig(
-            fp16=(dtype_from_hf(hf_config) == torch.float16),
-            bf16=(dtype_from_hf(hf_config) == torch.bfloat16),
-            params_dtype=dtype_from_hf(hf_config),
-        )
-        merge_hidden_size = vision_config.embed_dim * (vision_config.spatial_merge_size**2)
-        vision_projection_config = MultimodalProjectorConfig(
-            input_size=merge_hidden_size,
-            hidden_size=vision_config.hidden_size,
-            ffn_hidden_size=merge_hidden_size,
-            projector_type="mcore_mlp",
-            fp16=(dtype_from_hf(hf_config) == torch.float16),
-            bf16=(dtype_from_hf(hf_config) == torch.bfloat16),
-            params_dtype=dtype_from_hf(hf_config),
-        )
-
-        output = Qwen2VLConfig(
-            language_transformer_config=language_transformer_config,
-            vision_transformer_config=vision_transformer_config,
-            vision_projection_config=vision_projection_config,
-            vision_feature_layer=-1,
-            fp16=(dtype_from_hf(hf_config) == torch.float16),
-            bf16=(dtype_from_hf(hf_config) == torch.bfloat16),
-            params_dtype=dtype_from_hf(hf_config),
-        )
-
-        return output
-
-
-@io.model_exporter(Qwen2VLModel, "hf")
-class HFQwen2VLExporter(io.ModelConnector[Qwen2VLModel, "Qwen2VLForConditionalGeneration"]):
-    """
-    Exporter class for converting NeMo Qwen2VL model to HuggingFace format.
-
-    Inherits:
-        io.ModelConnector: Connector interface to handle setup, save, and load using the Lightning framework.
-
-    Methods:
-        init: Initializes a new HuggingFace Qwen2VL model instance.
-        apply: Converts the NeMo model to HuggingFace format and saves it.
-        convert_state: Maps and transforms the state dictionary from NeMo to HuggingFace format.
-        config: Generates and returns the HuggingFace Qwen2VL config for the model.
-    """
-
-    def init(self, dtype=torch.bfloat16) -> "Qwen2VLForConditionalGeneration":
-        """
-        Initializes a HuggingFace Qwen2VLForConditionalGeneration model.
-
-        Args:
-            dtype: The data type to use for the model (default: torch.bfloat16)
-
-        Returns:
-            Qwen2VLForConditionalGeneration: A HuggingFace Qwen2VL model initialized with the configuration.
-        """
-        from transformers.modeling_utils import no_init_weights
-
-        with no_init_weights():
-            return Qwen2VLForConditionalGeneration._from_config(self.config, torch_dtype=dtype)
-
-    def apply(self, output_path: Path) -> Path:
-        """
-        Converts the NeMo Qwen2VL model to HuggingFace format and saves it to the specified path.
-
-        Args:
-            output_path (Path): The path where the converted HuggingFace model will be saved.
-
-        Returns:
-            Path: The output path where the HuggingFace model was saved.
-        """
-        logging.info("Loading Qwen2VL NeMo checkpoint. This may take a while...")
-        source, source_config = self.ckpt_load(self)
-        logging.info("Qwen2VL NeMo checkpoint loaded.")
-        logging.info("Initializing the HF model..")
-        target = self.init()
-        logging.info("Start Converting the model..")
-        target = self.convert_state(source, target, source_config)
-        target = target.cpu()
-        target.save_pretrained(output_path)
-
-        try:
-            self.tokenizer.tokenizer.save_pretrained(output_path)
-        except Exception:
-            logging.warning("Failed to save tokenizer")
-
-        print(f"Converted Qwen2VL model saved to {output_path}")
-
-        return output_path
-
-    def convert_state(self, source, target, source_config):
-        # pylint: disable=C0115,C0116,line-too-long
-        """
-        Maps and transforms the state dictionary from NeMo to HuggingFace format.
-
-        Args:
-            source: The source NeMo model.
-            target: The target HuggingFace model.
-
-        Returns:
-            The target HuggingFace model with the converted state.
-        """
-
-        mapping = {
-            "vision_model.conv1.weight": "visual.patch_embed.proj.weight",
-            "vision_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "visual.blocks.*.norm1.weight",
-            "vision_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_bias": "visual.blocks.*.norm1.bias",
-            "vision_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "visual.blocks.*.norm2.weight",
-            "vision_model.decoder.layers.*.mlp.linear_fc1.layer_norm_bias": "visual.blocks.*.norm2.bias",
-            "vision_model.decoder.layers.*.self_attention.linear_proj.weight": "visual.blocks.*.attn.proj.weight",
-            "vision_model.decoder.layers.*.self_attention.linear_proj.bias": "visual.blocks.*.attn.proj.bias",
-            "vision_model.decoder.layers.*.mlp.linear_fc1.weight": "visual.blocks.*.mlp.fc1.weight",
-            "vision_model.decoder.layers.*.mlp.linear_fc1.bias": "visual.blocks.*.mlp.fc1.bias",
-            "vision_model.decoder.layers.*.mlp.linear_fc2.weight": "visual.blocks.*.mlp.fc2.weight",
-            "vision_model.decoder.layers.*.mlp.linear_fc2.bias": "visual.blocks.*.mlp.fc2.bias",
-            "vision_model.decoder.final_layernorm.weight": "visual.merger.ln_q.weight",
-            "vision_model.decoder.final_layernorm.bias": "visual.merger.ln_q.bias",
-            "language_model.embedding.word_embeddings.weight": "model.embed_tokens.weight",
-            "language_model.decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
-            "language_model.decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
-            "language_model.decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.input_layernorm.weight",
-            "language_model.decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.post_attention_layernorm.weight",
-            "language_model.decoder.final_layernorm.weight": "model.norm.weight",
-            # "language_model.output_layer.weight": "lm_head.weight",
-        }
-        if source_config.language_transformer_config.share_embeddings_and_output_weights:
-            mapping.update({"language_model.embedding.word_embeddings.weight": "lm_head.weight"})
+                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+            mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+            return position_ids, mrope_position_deltas
         else:
-            mapping.update({"language_model.output_layer.weight": "lm_head.weight"})
+            if attention_mask is not None:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
+                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+            else:
+                position_ids = (
+                    torch.arange(input_ids.shape[1], device=input_ids.device)
+                    .view(1, 1, -1)
+                    .expand(3, input_ids.shape[0], -1)
+                )
+                mrope_position_deltas = torch.zeros(
+                    [input_ids.shape[0], 1],
+                    device=input_ids.device,
+                    dtype=input_ids.dtype,
+                )
 
-        if "vision_projection.encoder.linear_fc1.weight" in source.state_dict().keys():
-            mapping.update(
-                {
-                    "vision_projection.encoder.linear_fc1.weight": "visual.merger.mlp.0.weight",
-                    "vision_projection.encoder.linear_fc1.bias": "visual.merger.mlp.0.bias",
-                    "vision_projection.encoder.linear_fc2.weight": "visual.merger.mlp.2.weight",
-                    "vision_projection.encoder.linear_fc2.bias": "visual.merger.mlp.2.bias",
-                }
-            )
-        elif "vision_projection.0.weight" in source.state_dict().keys():
-            mapping.update(
-                {
-                    "vision_projection.0.weight": "visual.merger.mlp.0.weight",
-                    "vision_projection.0.bias": "visual.merger.mlp.0.bias",
-                    "vision_projection.2.weight": "visual.merger.mlp.2.weight",
-                    "vision_projection.2.bias": "visual.merger.mlp.2.bias",
-                }
-            )
-        else:
-            raise KeyError("Unable to map vision projection keys.")
+            return position_ids, mrope_position_deltas
 
-        return io.apply_transforms(
-            source,
-            target,
-            mapping=mapping,
-            transforms=[
-                _export_language_qkv,
-                _export_language_qkv_bias,
-                _export_vision_qkv,
-                _export_vision_qkv_bias,
-                _export_linear_fc1,
-            ],
-        )
-
-    @property
-    def tokenizer(self) -> "TokenizerSpec":
-        """
-        Gets the tokenizer from the loaded model context.
-
-        Returns:
-            The tokenizer specification.
-        """
-        return io.load_context(str(self), subpath="model").tokenizer
-
-    def ckpt_load(self, path: Path) -> Tuple[Dict, Dict]:
-        """
-        This function loads the state dict directly from a distributed checkpoint, and modify the state dict
-        so that it is consistent with the key names you would get from loading the checkpoint into a model.
-        This is a more memory-efficient method to obtain a state dict without initializing the nemo model.
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,        
+    ) -> torch.Tensor:
+        """Forward function of the Qwen2VL model.
 
         Args:
-            path (Path): The path from which the model will be loaded.
-
-        Returns
-        -------
-            Tuple[Dict, Dict]: The loaded state dict and the yaml config dict.
-        """
-        config = io.load_context(str(self), subpath="model.config")
-        dist_ckpt_folder = path / "weights"
-        state_dict = {}
-
-        langauge_layers = config.language_transformer_config.num_layers
-        vision_layers = config.vision_transformer_config.num_layers
-        distributed_model_weights = load_distributed_model_weights(dist_ckpt_folder, True).items()
-        for k, v in distributed_model_weights:
-            if "_extra_state" in k:
-                continue
-            new_k = k.replace("module.", "")
-            if "layers" in new_k and (v.size(0) == langauge_layers or v.size(0) == vision_layers):
-                # Only split layers
-                for i in range(v.size(0)):
-                    state_dict[new_k.replace("layers", f"layers.{str(i)}")] = v[i]
-            state_dict[new_k] = v
-
-        source = _ModelState(state_dict)
-        return source, config
-
-    @property
-    def config(self) -> "HFQwen2VLConfig":
-        """
-        Generates the configuration for the HuggingFace Qwen2VL model based on the NeMo model.
-
+            input_ids (torch.Tensor): input text ids [batch, decoder_seq_len].
+            attention_mask (torch.Tensor): Attention mask for the language model [batch, 1, combined_seq_len,
+            combined_seq_len].
+            position_ids (torch.Tensor): input text position ids [batch, decoder_seq_len].
+            loss_mask (torch.Tensor): Text loss mask [batch, decoder_seq_len].
+            labels (torch.Tensor): Optional target text labels [batch, combined_seq_len].
+            inference_params (InferenceParams): Inference-time parameters including KV cache.
+            pixel_values (torch.Tensor): input image of shape [images_total_patches,
+            num_channels * temporal_size * patch_size * patch_size].
+            pixel_values_videos (torch.Tensor): input video of shape [videos_total_patches,
+            num_channels * temporal_size * patch_size * patch_size].
+            image_grid_thw (torch.Tensor): The temporal, height and width of feature shape of each image.
+            Shape [num_images, 3].
+            video_grid_thw (torch.Tensor): The temporal, height and width of feature shape of each video.
+            Shape [num_videos, 3].
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
+            packed_seq_params (PackedSeqParams): Dict with padded token information.
+                Required for using SP/CP with padding mask type.
+                
         Returns:
-            HFQwen2VLConfig: A configuration object for the HuggingFace Qwen2VL model.
+            output (torch.Tensor): Loss of shape [b, s] if labels are provided,
+                otherwise logits of shape [b, s, vocab_size].
+            loss_mask (torch.Tensor): Loss mask expanded to combined sequence length. Shape [b, s].
         """
-
-        source = io.load_context(str(self), subpath="model.config")
-
-        language_config = source.language_transformer_config
-        vision_model_config = source.vision_transformer_config
-        vision_projection_config = source.vision_projection_config
-
-        vision_config = HFQwen2VLVisionConfig(
-            depth=vision_model_config.num_layers,
-            embed_dim=vision_model_config.embed_dim,
-            hidden_size=vision_projection_config.hidden_size,
-            hidden_act="quick_gelu",
-            mlp_ratio=int(vision_projection_config.ffn_hidden_size // vision_model_config.hidden_size),
-            num_heads=vision_model_config.num_attention_heads,
-            in_channels=3,
-            patch_size=vision_model_config.patch_dim,
-            spatial_merge_size=vision_model_config.spatial_merge_size,
-            spatial_patch_size=vision_model_config.spatial_patch_size,
-            temporal_patch_size=vision_model_config.temporal_patch_size,
-            initializer_range=vision_model_config.init_method_std,
-            model_type="qwen2_vl",
-            torch_dtype="bfloat16",
-        ).to_dict()
-
-        # Create the Qwen2VLConfig for HuggingFace
-        # if transformers > 4.51.3, use Qwen2VLTextConfig as text_config
-        # https://github.com/huggingface/transformers/pull/37268
-        return HFQwen2VLConfig(
-            num_hidden_layers=language_config.num_layers,
-            hidden_size=language_config.hidden_size,
-            intermediate_size=language_config.ffn_hidden_size,
-            num_attention_heads=language_config.num_attention_heads,
-            initializer_range=language_config.init_method_std,
-            rms_norm_eps=language_config.layernorm_epsilon,
-            num_key_value_heads=language_config.num_query_groups,
-            rope_theta=language_config.rotary_base,
-            tie_word_embeddings=language_config.share_embeddings_and_output_weights,
-            vocab_size=language_config.vocab_size,
-            vision_config=vision_config,
-            torch_dtype="bfloat16",
+        use_inference_kv_cache = (
+            inference_params is not None and "image_tokens_count" in inference_params.key_value_memory_dict
         )
 
+        has_images = pixel_values is not None
+        has_videos = pixel_values_videos is not None
 
-def import_qkv(q, k, v, head_num, num_query_groups, heads_per_group, hidden_size, head_size):
-    # pylint: disable=C0115,C0116
-    old_tensor_shape = q.size()
-    new_q_tensor_shape = (head_num, head_size) + old_tensor_shape[1:]
-    new_kv_tensor_shape = (num_query_groups, head_size) + old_tensor_shape[1:]
+        image_embeddings = None
+        if use_inference_kv_cache:
+            # If running inference, we can skip media token computation if they were computed already earlier
+            # for this sample.
+            image_embeddings = None
+        elif self.add_encoder and not has_images:
+            # If no images provided, use an empty image embeddings tensor.
+            image_embeddings = None
+        elif self.add_encoder and has_images:
+            pixel_values = pixel_values.to(next(self.vision_model.parameters()).dtype)
+            image_embeddings = self.vision_model(pixel_values, grid_thw=image_grid_thw)  # [bs, img_seq_len, h_vision]
 
-    q = q.view(*new_q_tensor_shape)
-    k = k.view(*new_kv_tensor_shape)
-    v = v.view(*new_kv_tensor_shape)
+            if self._drop_vision_class_token:
+                class_token_len = getattr(self.vision_model, "class_token_len", 1)
+                image_embeddings = image_embeddings[:, class_token_len:, :]
 
-    qkv_weights_l = []
-    for i in range(num_query_groups):
-        qkv_weights_l.append(q[i * heads_per_group : (i + 1) * heads_per_group, :, :])
-        qkv_weights_l.append(k[i : i + 1, :, :])
-        qkv_weights_l.append(v[i : i + 1, :, :])
-    qkv_weights = torch.cat(qkv_weights_l)
-    assert qkv_weights.ndim == 3, qkv_weights.shape
-    assert qkv_weights.shape[0] == (heads_per_group + 2) * num_query_groups, qkv_weights.shape
-    assert qkv_weights.shape[1] == head_size, qkv_weights.shape
-    assert qkv_weights.shape[2] == old_tensor_shape[1], qkv_weights.shape
+            image_embeddings = self.vision_projection(image_embeddings)
 
-    qkv_weights = qkv_weights.reshape([head_size * (head_num + 2 * num_query_groups), hidden_size])
+            # TODO: Support batched inference.
+            # In inference, the language model KV cache will be updated for image token positions.
+            # Store the image tokens sequence length to be used as an offset to the KV cache later.
+            if inference_params is not None:
+                inference_params.key_value_memory_dict["media_tokens_count"] = (
+                    image_embeddings.shape[1] * image_embeddings.shape[2]
+                )
+        else:
+            image_embeddings = self.encoder_hidden_state
 
-    return qkv_weights
+        video_embeddings = None
+        if self.add_encoder and has_videos:
+            pixel_values_videos = pixel_values_videos.to(next(self.vision_model.parameters()).dtype)
+            video_embeddings = self.vision_model(
+                pixel_values_videos, grid_thw=video_grid_thw
+            )  # [bs, img_seq_len, h_vision]
+            video_embeddings = self.vision_projection(video_embeddings)
+        if not self.add_decoder:
+            return image_embeddings
 
+        # language_embeddings is a container for text, image and video embeddings; to feed to decoder
+        language_embeddings = None
 
-@io.state_transform(
-    source_key=("visual.blocks.*.attn.qkv.weight",),
-    target_key="vision_model.decoder.layers.*.self_attention.linear_qkv.weight",
-)
-def _import_vision_qkv(ctx: io.TransformCTX, hf_qkv_weights):
-    # pylint: disable=C0115,C0116
-    megatron_config = ctx.target.config.vision_transformer_config
+        language_seq_len = input_ids.shape[1]
+        # chunk if input seq_len > _language_max_sequence_length
+        if language_seq_len > self._language_max_sequence_length:
+            input_ids = input_ids[:, : self._language_max_sequence_length]
+            if position_ids is not None:
+                position_ids = position_ids[:, :, : self._language_max_sequence_length]
 
-    slice = int(hf_qkv_weights.shape[0] / 3)
-    assert slice == megatron_config.hidden_size
-    q = hf_qkv_weights[:slice, :]
-    k = hf_qkv_weights[slice : slice * 2, :]
-    v = hf_qkv_weights[slice * 2 :, :]
+            if labels is not None and labels.shape[1] > self._language_max_sequence_length:
+                labels = labels[:, : self._language_max_sequence_length]
+                loss_mask = loss_mask[:, : self._language_max_sequence_length]
 
-    return import_qkv(
-        q,
-        k,
-        v,
-        head_num=megatron_config.num_attention_heads,
-        num_query_groups=megatron_config.num_query_groups,
-        heads_per_group=megatron_config.num_attention_heads // megatron_config.num_query_groups,
-        hidden_size=megatron_config.hidden_size,
-        head_size=megatron_config.kv_channels,
-    )
+        packed_sequence = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+        max_seq_len = self._language_max_sequence_length
 
+        # Pipeline parallel expects fixed input size. Check if we need to pad.
+        if self._language_is_pipeline_parallel and language_seq_len < self._language_max_sequence_length:
+            padded_seq_len = self._language_max_sequence_length - language_seq_len
+            input_ids = torch.nn.functional.pad(input_ids, (0, padded_seq_len))
+            if position_ids is not None:
+                position_ids = torch.nn.functional.pad(position_ids, (0, padded_seq_len))
 
-@io.state_transform(
-    source_key=("visual.blocks.*.attn.qkv.bias",),
-    target_key="vision_model.decoder.layers.*.self_attention.linear_qkv.bias",
-)
-def _import_vision_qkv_bias(ctx: io.TransformCTX, hf_qkv_bias):
-    # pylint: disable=C0115,C0116
-    megatron_config = ctx.target.config.vision_transformer_config
+            if packed_sequence:
+                last_seqlen = packed_seq_params.cu_seqlens_q[-1] - packed_seq_params.cu_seqlens_q[-2]
+                last_seqlen_padded = max_seq_len - packed_seq_params.cu_seqlens_q_padded[-2]
+                assert (
+                    last_seqlen_padded >= last_seqlen
+                ), "`language_max_sequence_length` needs to increase for sequence packing to work properly."
+                packed_seq_params.cu_seqlens_q_padded[-1] = max_seq_len
+                packed_seq_params.cu_seqlens_kv_padded[-1] = max_seq_len
+                packed_seq_params.max_seqlen_q = max(last_seqlen_padded, packed_seq_params.max_seqlen_q)
+                packed_seq_params.max_seqlen_kv = max(last_seqlen_padded, packed_seq_params.max_seqlen_kv)
 
-    slice = int(hf_qkv_bias.shape[0] / 3)
-    assert slice == megatron_config.hidden_size
+        # language_embeddings is a container for text, image and video embeddings; to feed to decoder
+        language_embeddings = None
 
-    q_bias = hf_qkv_bias[:slice]
-    k_bias = hf_qkv_bias[slice : slice * 2]
-    v_bias = hf_qkv_bias[slice * 2 :]
+        # Create the language_embeddings (if this is the first language model stage).
+        if self.pre_process:
+            input_ids_text = input_ids.clone()
+            # MultiModal Token indices are assumed to be values
+            input_ids_text[input_ids_text < 0] = 0
 
-    return import_qkv(
-        q_bias.unsqueeze(-1),
-        k_bias.unsqueeze(-1),
-        v_bias.unsqueeze(-1),
-        head_num=megatron_config.num_attention_heads,
-        num_query_groups=megatron_config.num_query_groups,
-        heads_per_group=megatron_config.num_attention_heads // megatron_config.num_query_groups,
-        hidden_size=1,
-        head_size=megatron_config.kv_channels,
-    ).squeeze(-1)
+            language_embeddings = self.language_model.embedding(
+                input_ids=input_ids_text, position_ids=None
+            )  # [decoder_seq_len, b, h_language]
 
+            language_embeddings = language_embeddings.transpose(1, 0).contiguous()  # [b, decoder_seq_len, h_language]
 
-@io.state_transform(
-    source_key=(
-        "model.layers.*.self_attn.q_proj.weight",
-        "model.layers.*.self_attn.k_proj.weight",
-        "model.layers.*.self_attn.v_proj.weight",
-    ),
-    target_key="language_model.decoder.layers.*.self_attention.linear_qkv.weight",
-)
-def _import_language_qkv(ctx: io.TransformCTX, q, k, v):
-    # pylint: disable=C0115,C0116
-    megatron_config = ctx.target.config.language_transformer_config
-    return import_qkv(
-        q,
-        k,
-        v,
-        head_num=megatron_config.num_attention_heads,
-        num_query_groups=megatron_config.num_query_groups,
-        heads_per_group=megatron_config.num_attention_heads // megatron_config.num_query_groups,
-        hidden_size=megatron_config.hidden_size,
-        head_size=megatron_config.kv_channels,
-    )
+        # Preprocess input, labels and loss mask.
+        combined_embeddings, final_labels, final_loss_mask, final_attention_mask = self._preprocess_data(
+            input_ids,
+            loss_mask=loss_mask,
+            labels=labels,
+            language_embeddings=language_embeddings,
+            image_embeddings=image_embeddings,
+            video_embeddings=video_embeddings,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
+        )  # [decoder_seq_len, b, h_language], [b, decoder_seq_len], [b, decoder_seq_len]
 
+        # generate position IDs
+        if position_ids is None and input_ids is not None:
+            if packed_sequence:
+                if packed_seq_params.cu_seqlens_q_padded is not None:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+                else:
+                    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                if packed_seq_params.cu_seqlens_kv_padded is not None:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+                else:
+                    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
 
-@io.state_transform(
-    source_key=(
-        "model.layers.*.self_attn.q_proj.bias",
-        "model.layers.*.self_attn.k_proj.bias",
-        "model.layers.*.self_attn.v_proj.bias",
-    ),
-    target_key="language_model.decoder.layers.*.self_attention.linear_qkv.bias",
-)
-def _import_language_qkv_bias(ctx: io.TransformCTX, q_bias, k_bias, v_bias):
-    # pylint: disable=C0115,C0116
-    megatron_config = ctx.target.config.language_transformer_config
-    return import_qkv(
-        q_bias.unsqueeze(-1),
-        k_bias.unsqueeze(-1),
-        v_bias.unsqueeze(-1),
-        head_num=megatron_config.num_attention_heads,
-        num_query_groups=megatron_config.num_query_groups,
-        heads_per_group=megatron_config.num_attention_heads // megatron_config.num_query_groups,
-        hidden_size=1,
-        head_size=megatron_config.kv_channels,
-    ).squeeze(-1)
+                assert isinstance(cu_seqlens_q, torch.Tensor) and isinstance(cu_seqlens_kv, torch.Tensor), \
+                    f"Got unexpected packed_seq_params value. {packed_seq_params}"
 
+                if len(cu_seqlens_q) == 2:
+                    # only 1 sampel in packed seq
+                    position_ids, _ = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, attention_mask)
+                elif len(cu_seqlens_q) > 2:
+                    # split input_ids on seq_len
+                    packed_position_ids = []
 
-@io.state_transform(
-    source_key=("vision_model.embeddings.class_embedding",),
-    target_key="vision_model.class_token",
-)
-def _import_cls_token(ctx: io.TransformCTX, cls_token):
-    # pylint: disable=C0115,C0116
-    return cls_token.reshape(1, 1, -1)
+                    seqlens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+                    splitted_input_ids = [
+                            x for x in torch.split(input_ids, seqlens, dim=1)
+                    ]
 
+                    if image_grid_thw is not None:                    
+                        assert image_grid_thw.shape[0] == len(splitted_input_ids), \
+                                f"Got unexpected batch size value. {image_grid_thw.shape=}," \
+                                f"{{input_ids.shape=}} {len(splitted_input_ids)} "
+                    if video_grid_thw is not None:                    
+                        assert video_grid_thw.shape[0] == len(splitted_input_ids), \
+                            f"Got unexpected batch size value. {video_grid_thw.shape=}," \
+                            f" {{input_ids.shape=}} {len(splitted_input_ids)} "
 
-@io.state_transform(
-    source_key=(
-        "model.layers.*.mlp.gate_proj.weight",
-        "model.layers.*.mlp.up_proj.weight",
-    ),
-    target_key="language_model.decoder.layers.*.mlp.linear_fc1.weight",
-)
-def _import_linear_fc1(down, gate):
-    # pylint: disable=C0115,C0116
-    return torch.cat((down, gate), axis=0)
+                    for i in range(len(splitted_input_ids)):
+                        _input_ids = splitted_input_ids[i]
+                        _image_grid_thw = image_grid_thw[i, :].reshape(1,3) if image_grid_thw is not None else None
+                        _video_grid_thw = video_grid_thw[i, :].reshape(1,3) if video_grid_thw is not None else None
 
+                        _position_ids, _ = self.get_rope_index(_input_ids, _image_grid_thw, _video_grid_thw, None)
+                        packed_position_ids.append(_position_ids)
 
-@io.state_transform(
-    source_key="vision_model.decoder.layers.*.self_attention.linear_qkv.weight",
-    target_key="visual.blocks.*.attn.qkv.weight",
-)
-def _export_vision_qkv(ctx: io.TransformCTX, qkv):
-    # pylint: disable=C0115,C0116
-    hf_config = ctx.target.config.vision_config
-    return torch.cat(
-        export_qkv(
-            qkv,
-            head_num=hf_config.num_heads,
-            num_query_groups=hf_config.num_heads,
-            heads_per_group=hf_config.num_heads // hf_config.num_heads,
-            hidden_size=hf_config.embed_dim,
-            head_size=hf_config.embed_dim // hf_config.num_heads,
-        ),
-        axis=0,
-    )
+                    position_ids = torch.cat(packed_position_ids, dim=2)
+                else:
+                    raise ValueError("Got unexpected cu_seqlens_kv value. {cu_seqlens_kv}")
+            else:
+                # relugar input data
+                position_ids, _ = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, attention_mask)
 
 
-@io.state_transform(
-    source_key="vision_model.decoder.layers.*.self_attention.linear_qkv.bias",
-    target_key="visual.blocks.*.attn.qkv.bias",
-)
-def _export_vision_qkv_bias(ctx: io.TransformCTX, qkv_bias):
-    # pylint: disable=C0115,C0116
-    hf_config = ctx.target.config.vision_config
-    return torch.cat(
-        export_qkv_bias(
-            qkv_bias,
-            head_num=hf_config.num_heads,
-            num_query_groups=hf_config.num_heads,
-            heads_per_group=hf_config.num_heads // hf_config.num_heads,
-            head_size=hf_config.embed_dim // hf_config.num_heads,
-        ),
-        axis=0,
-    )
+        if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
+
+            combined_embeddings, final_labels, final_loss_mask, packed_seq_params = (
+                self._process_embedding_token_parallel(
+                    combined_embeddings, final_labels, final_loss_mask, packed_seq_params
+                )
+            )
+
+        output = self.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=final_attention_mask,
+            decoder_input=combined_embeddings,
+            labels=final_labels,
+            inference_params=inference_params,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,            
+        )  # output shape: [batch_size, seq length, vocab_size]
+
+        if labels is None or loss_mask is None:
+            return output
+        else:
+            return output, final_loss_mask.contiguous()
+
+    def set_input_tensor(self, input_tensor) -> None:
+        """Set model chunk input tensor."""
+        # This is usually handled in schedules.py but some inference code still
+        # gives us non-lists or None
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for llava'
+
+        if self.add_encoder and self.add_decoder:
+            self.vision_model.set_input_tensor(input_tensor[0])
+        elif self.add_encoder:
+            self.vision_model.set_input_tensor(input_tensor[0])
+        elif self.pre_process:
+            self.encoder_hidden_state = input_tensor[0]
+        else:
+            self.language_model.set_input_tensor(input_tensor[0])
+
+    # override _preprocess_data() in megatron-lm/megatron/core/models/multimodal/llava_model.py
+    def _preprocess_data(
+        self,
+        input_ids: torch.Tensor,
+        loss_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        language_embeddings: Optional[torch.Tensor] = None,
+        image_embeddings: Optional[torch.Tensor] = None,
+        video_embeddings: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        use_inference_kv_cache: Optional[bool] = False,
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,     
+    ):
+        """
+        MCoreQwen2VLModel uses its own version of _preprocess_data instead of MCoreLLaVAModel's (in
+        megatron-lm/megatron/core/models/multimodal/llava_model.py)
+
+        This function handles several data preprocess requirements:
+            - merge image and/or video embeddings into language embedding
+            - padding inputs variables (e.g. labels/loss masks) for pipeline_parallel case
+            - truncate inputs variables (e.g. labels/loss masks) if exceeding max seq length
+
+        This function won't shift labels as forward() and _preprocess_data() in MCoreQwen2VLModel
+        expect labels from input arguments already handle this shift.
+
+        About merging image/video embeddings: language_embeddings may include num of imgage_token
+        placeholders, and this function will put each imgage_token from image_embeddings into
+        placeholder within language_embeddings(1:1 mapping), when image_embeddings/video_embeddings
+        is available and it's the 1st pipeline_parallel stage
+        """
+
+        assert self.add_decoder, "input text preprocessing is only needed for the language model"
+
+        # No pre- or postprocessing needed.
+        # With pipeline parallel > 2, this means a chunk in the middle of the model.
+        if not self.pre_process and not self.post_process:
+            return None, None, None, None
+
+        # If using the inference KV cache, the image tokens are already computed.
+        if use_inference_kv_cache:
+            return language_embeddings, loss_mask, labels, attention_mask
+
+        # img_seq_len = self._img_seq_len
+        batch_size, language_seq_len = input_ids.shape
+
+        has_labels = labels is not None
+        if has_labels:
+            assert (
+                labels.shape == loss_mask.shape
+            ), f"mismatching labels shape {labels.shape} and loss mask shape {loss_mask.shape}"
+
+        has_images = image_embeddings is not None
+        has_videos = video_embeddings is not None
+        packed_sequence = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+
+        #
+        # Create the final input embedding (if this is the first language model stage).
+        #
+        final_embedding = None
+        if self.pre_process:
+            final_embedding = language_embeddings
+
+            # merge image embeddings into language_embeddings
+            if has_images:
+                # has images, merge image_embeddings into final_embedding
+                n_image_tokens = (input_ids == IMAGE_TOKEN_INDEX).sum().item()
+                n_image_features = image_embeddings.shape[0]
+
+                if n_image_tokens != n_image_features:
+                    raise ValueError(
+                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, "
+                        f"features {n_image_features}"
+                    )
+
+                image_mask = (
+                    (input_ids == IMAGE_TOKEN_INDEX)
+                    .unsqueeze(-1)
+                    .expand_as(final_embedding)
+                    .to(final_embedding.device)
+                )
+                image_embeddings = image_embeddings.to(final_embedding.device, final_embedding.dtype)
+                final_embedding = final_embedding.masked_scatter(
+                    image_mask, image_embeddings
+                )  #  [b, seq_len, h_language]
+
+            # merge video embeddings into final_embedding
+            if has_videos:
+                # has images, merge image_embeddings into final_embedding
+                n_video_tokens = (input_ids == VIDEO_TOKEN_INDEX).sum().item()
+                n_video_features = video_embeddings.shape[0]
+
+                if n_video_tokens != n_video_features:
+                    raise ValueError(
+                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, "
+                        f"features {n_video_features}"
+                    )
+
+                video_mask = (
+                    (input_ids == VIDEO_TOKEN_INDEX)
+                    .unsqueeze(-1)
+                    .expand_as(final_embedding)
+                    .to(final_embedding.device)
+                )
+                video_embeddings = video_embeddings.to(final_embedding.device, final_embedding.dtype)
+                final_embedding = final_embedding.masked_scatter(video_mask, video_embeddings)
+
+        #
+        # Create the final labels and loss mask (if this is the last language model stage).
+        #
+        final_labels, final_loss_mask = None, None
+
+        if self.post_process and has_labels:
+
+            # Pipeline parallel expects fixed input size. Check if we need to pad
+            if self._language_is_pipeline_parallel and labels.shape[1] < self._language_max_sequence_length:
+                max_seq_len = self._language_max_sequence_length
+                final_labels = torch.full(
+                    (batch_size, max_seq_len), IGNORE_INDEX, dtype=labels.dtype, device=labels.device
+                )
+                final_loss_mask = torch.full(
+                    (batch_size, max_seq_len), 0, dtype=loss_mask.dtype, device=loss_mask.device
+                )
+                final_labels[:, : labels.shape[1]] = labels[:, :]
+                final_loss_mask[:, : labels.shape[1]] = loss_mask[:, :]
+            else:
+                final_labels, final_loss_mask = labels, loss_mask
+
+        if final_embedding is not None and final_labels is not None:
+            assert (
+                final_embedding.shape[:2] == final_labels.shape == final_loss_mask.shape
+            ), "unexpected shapes after data preprocessing"
 
 
-@io.state_transform(
-    source_key="language_model.decoder.layers.*.self_attention.linear_qkv.weight",
-    target_key=(
-        "model.layers.*.self_attn.q_proj.weight",
-        "model.layers.*.self_attn.k_proj.weight",
-        "model.layers.*.self_attn.v_proj.weight",
-    ),
-)
-def _export_language_qkv(ctx: io.TransformCTX, qkv):
-    # pylint: disable=C0115,C0116
-    hf_config = ctx.target.config
-    return export_qkv(
-        qkv,
-        head_num=hf_config.num_attention_heads,
-        num_query_groups=hf_config.num_key_value_heads,
-        heads_per_group=hf_config.num_attention_heads // hf_config.num_key_value_heads,
-        hidden_size=hf_config.hidden_size,
-        head_size=hf_config.hidden_size // hf_config.num_attention_heads,
-    )
+        truncate_labels = final_labels is not None and final_labels.shape[1] > self._language_max_sequence_length
+        if truncate_labels:
+            final_labels = final_labels[:, : self._language_max_sequence_length]
+            final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
+
+        # truncate final embedding
+        if final_embedding is not None:
+            # transpose final_embeddings to sbhd
+            # note this will also transpose thd, which is fine
+            final_embedding = final_embedding.transpose(1, 0).contiguous()
+            # Truncate if exceeding the language model's max sequence length.
+            if final_embedding.shape[0] > self._language_max_sequence_length:
+                final_embedding = final_embedding[: self._language_max_sequence_length]
+
+        # packed seq param truncation
+        if packed_sequence and packed_seq_params.cu_seqlens_q_padded[-1] > self._language_max_sequence_length:
+            truncate_len = packed_seq_params.cu_seqlens_q_padded[-1] - self._language_max_sequence_length
+            final_seq_len_padded = (
+                packed_seq_params.cu_seqlens_q_padded[-1] - packed_seq_params.cu_seqlens_q_padded[-2]
+            )
+            final_seq_len_unpadded = packed_seq_params.cu_seqlens_q[-1] - packed_seq_params.cu_seqlens_q[-2]
+            final_padding = final_seq_len_padded - final_seq_len_unpadded
+            truncate_len -= final_padding
+            packed_seq_params.cu_seqlens_q_padded[-1] = self._language_max_sequence_length
+            packed_seq_params.cu_seqlens_kv_padded[-1] = self._language_max_sequence_length
+            # need to truncate the actual sequence as well
+            if truncate_len > 0:
+                packed_seq_params.cu_seqlens_q[-1] -= truncate_len
+                packed_seq_params.cu_seqlens_kv[-1] -= truncate_len
+            assert (
+                packed_seq_params.cu_seqlens_q[-1] >= packed_seq_params.cu_seqlens_q[-2]
+            ), "with packed sequence, the truncation can only truncate on the last sequence."
+
+        return final_embedding, final_labels, final_loss_mask, attention_mask
 
 
-@io.state_transform(
-    source_key="language_model.decoder.layers.*.self_attention.linear_qkv.bias",
-    target_key=(
-        "model.layers.*.self_attn.q_proj.bias",
-        "model.layers.*.self_attn.k_proj.bias",
-        "model.layers.*.self_attn.v_proj.bias",
-    ),
-)
-def _export_language_qkv_bias(ctx: io.TransformCTX, qkv_bias):
-    # pylint: disable=C0115,C0116
-    hf_config = ctx.target.config
-    return export_qkv_bias(
-        qkv_bias,
-        head_num=hf_config.num_attention_heads,
-        num_query_groups=hf_config.num_key_value_heads,
-        heads_per_group=hf_config.num_attention_heads // hf_config.num_key_value_heads,
-        head_size=hf_config.hidden_size // hf_config.num_attention_heads,
-    )
+    def _process_embedding_token_parallel(self, combined_embeddings, new_labels, new_loss_mask, packed_seq_params):
+        """Processes the input data for model parallelism support."""
+
+        # No pre or post processing needed with PP middle chunks.
+        if not self.pre_process and not self.post_process:
+            return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+
+        if self.pre_process:
+            # shard_factor, seq_dim = self._get_shard_factor(packed_seq_params)
+            if self.context_parallel_lm > 1 and self.sequence_parallel_lm:
+                shard_factor = self.tensor_model_parallel_size_lm * self.context_parallel_lm * 2
+                seq_dim = 1
+            elif self.context_parallel_lm > 1:
+                shard_factor = self.context_parallel_lm * 2
+                seq_dim = 1
+            elif self.sequence_parallel_lm:
+                shard_factor = self.tensor_model_parallel_size_lm
+                seq_dim = 0
+
+            assert (
+                combined_embeddings.shape[seq_dim] % shard_factor == 0
+            ), f"Sequence length should be divisible by {shard_factor} for \
+                Sequence/Context parallelism {combined_embeddings.shape} with dim {seq_dim}"
+            if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
+                assert (
+                    combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
+                ), "TP Comm overlap either requires Vision+Text token length \
+                == language_max_sequence_length"
+
+        if self.context_parallel_lm > 1:
+            batch = dict()
+            if self.pre_process:
+                batch.update(
+                    {
+                        "combined_embeddings": combined_embeddings,
+                    }
+                )
+            if self.post_process:
+                batch.update(
+                    {
+                        "new_labels": new_labels,
+                        "new_loss_mask": new_loss_mask,
+                    }
+                )
+
+            if self.pre_process:
+                batch["combined_embeddings"] = batch["combined_embeddings"].transpose(0, 1)
+
+            # Distribute sequence across CP ranks
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                try:
+                    import transformer_engine_torch as tex
+                except ModuleNotFoundError as e:
+                    logging.error(
+                        "Please update Transformer Engine to >= 1.10 to use \
+                            Context Parallel with THD format data"
+                    )
+                    raise e
+                cp_size = ps.get_context_parallel_world_size()
+                cp_rank = ps.get_context_parallel_rank()
+                for key, data in batch.items():
+                    index = tex.thd_get_partitioned_indices(
+                        packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
+                    )
+                    batch[key] = data.index_select(1, index)
+            else:
+                from megatron.core.utils import get_batch_on_this_cp_rank
+
+                batch = get_batch_on_this_cp_rank(batch)
+
+            if self.pre_process:
+                combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]
+                combined_embeddings = combined_embeddings.transpose(1, 0).contiguous()  # [B,S/CP,H] -> [S/CP,B,H]
+            if self.post_process:
+                new_labels = batch["new_labels"]
+                new_loss_mask = batch["new_loss_mask"]
+
+        if self.sequence_parallel_lm and self.pre_process:
+            combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                combined_embeddings
+            )  # [S/(CP*TP),B,H]
+
+        return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+
+class Qwen2VLModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNMixin):
+    """Lightning Wrapper for Qwen2VL Model"""
+
+    def __init__(
+        self,
+        config: Qwen2VLConfig,
+        optim: Optional[OptimizerModule] = None,
+        tokenizer: Optional["TokenizerSpec"] = None,
+        model_transform: Optional[Callable[[nn.Module], nn.Module]] = None,
+    ):
+        # pylint: disable=C0115,C0116
+        super().__init__()
+        self.config = config
+        self.tokenizer = tokenizer
+        self.optim = optim or MegatronOptimizerModule(config=OptimizerConfig(lr=1e-4, use_distributed_optimizer=True))
+        self.optim.connect(self)  # This will bind the `configure_optimizers` method
+        self.model_transform = model_transform
+        self._training_loss_reduction = None
+        self._validation_loss_reduction = None
+
+    def configure_model(self) -> None:
+        # pylint: disable=C0115,C0116
+        if not hasattr(self, "module"):
+            self.module = self.config.configure_model(self.tokenizer)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,                
+    ) -> torch.Tensor:
+        # pylint: disable=C0115,C0116
+        output_tensor = self.module(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            loss_mask=loss_mask,
+            labels=labels,
+            inference_params=inference_params,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            packed_seq_params=packed_seq_params,
+        )
+
+        return output_tensor
+
+    def data_step(self, dataloader_iter) -> Dict[str, torch.Tensor]:
+        # pylint: disable=C0115,C0116
+        return self.config.data_step_fn(dataloader_iter)
+
+    def forward_step(self, batch) -> torch.Tensor:
+        # pylint: disable=C0115,C0116
+        return self.config.forward_step_fn(self, batch)
+
+    def training_step(self, batch, batch_idx=None) -> torch.Tensor:
+        # pylint: disable=C0115,C0116
+        # In mcore the loss-function is part of the forward-pass (when labels are provided)
+        return self.forward_step(batch)
+
+    def validation_step(self, batch, batch_idx=None) -> torch.Tensor:
+        # pylint: disable=C0115,C0116
+        # In mcore the loss-function is part of the forward-pass (when labels are provided)
+
+        return self.forward_step(batch)
+
+    @property
+    def training_loss_reduction(self) -> MaskedTokenLossReductionWithLossMask:
+        # pylint: disable=C0115,C0116
+        if not self._training_loss_reduction:
+            self._training_loss_reduction = MaskedTokenLossReductionWithLossMask()
+
+        return self._training_loss_reduction
+
+    @property
+    def validation_loss_reduction(self) -> MaskedTokenLossReductionWithLossMask:
+        # pylint: disable=C0115,C0116
+        if not self._validation_loss_reduction:
+            self._validation_loss_reduction = MaskedTokenLossReductionWithLossMask(validation_step=True)
+
+        return self._validation_loss_reduction
 
 
-@io.state_transform(
-    source_key="vision_model.class_token",
-    target_key="vision_model.embeddings.class_embedding",
-)
-def _export_cls_token(ctx: io.TransformCTX, cls_token):
-    # pylint: disable=C0115,C0116
-    return cls_token.squeeze()
-
-
-@io.state_transform(
-    source_key="language_model.decoder.layers.*.mlp.linear_fc1.weight",
-    target_key=(
-        "model.layers.*.mlp.gate_proj.weight",
-        "model.layers.*.mlp.up_proj.weight",
-    ),
-)
-def _export_linear_fc1(linear_fc1):
-    # pylint: disable=C0115,C0116
-    gate_proj, up_proj = torch.chunk(linear_fc1, 2, dim=0)
-    return gate_proj, up_proj
+__all__ = [
+    "Qwen2VLModel",
+    "Qwen2VLConfig",
+    "qwen2vl_data_step",
+    "qwen2vl_forward_step",
+]
