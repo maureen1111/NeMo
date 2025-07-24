@@ -22,9 +22,22 @@ from nemo.utils.model_utils import unwrap_model
 mto, HAVE_MODELOPT = safe_import("modelopt.torch.opt")
 mtsp, _ = safe_import("modelopt.torch.speculative")
 
+EAGLE3_DEFAULT_CFG = {
+    "algorithm": "eagle",
+    "config": {
+        "eagle_num_layers": 1,
+        "eagle_hidden_state_distillation": False,
+        "eagle_disable_moe": True,
+        "use_aux_hidden_state": True,
+        "eagle_aux_hidden_state_layer_ids": [],
+        "use_input_layernorm_in_first_layer": True,
+        "use_last_layernorm": True,
+        "use_mtp_layernorm": False,
+    },
+}
 
 ALGORITHMS = {
-    "eagle3": mtsp.EAGLE3_DEFAULT_CFG,
+    "eagle3": EAGLE3_DEFAULT_CFG,
     # more TBD
 }
 

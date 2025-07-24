@@ -91,6 +91,7 @@ def main(args):
             tokenizer=tokenizer,
             image_processor=image_processor,
             num_workers=1,
+            packed_sequence=args.use_packed_sequence, 			
         )
     elif args.data_type == "energon":
         from nemo.collections.multimodal.data.energon import EnergonMultiModalDataModule
@@ -159,6 +160,7 @@ def main(args):
         encoder_pipeline_model_parallel_size=args.encoder_pp_size,
         pipeline_dtype=torch.bfloat16,
         sequence_parallel=args.enable_sp,
+        context_parallel_size=args.cp_size,
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=True,
@@ -166,7 +168,6 @@ def main(args):
             overlap_param_gather=True,
             average_in_collective=True,
         ),
-        ckpt_load_strictness="log_all",
     )
 
     # Checkpoint callback setup
@@ -287,8 +288,14 @@ if __name__ == "__main__":
     parser.add_argument("--mbs", type=int, required=False, default=2, help="Micro batch size")
     parser.add_argument("--lr", type=float, required=False, default=2.0e-06, help="Learning rate")
     parser.add_argument('--enable_sp', action='store_true', help="enable sequence parallel")
+    parser.add_argument("--cp_size", type=int, required=False, default=1)
     parser.add_argument(
         "--max_sequence_length", type=int, required=False, default=4096, help="Maximum sequence length"
+    )
+    parser.add_argument(
+        "--use_packed_sequence",
+        action="store_true",
+        help="enable sequence parallel"
     )
 
     args = parser.parse_args()
